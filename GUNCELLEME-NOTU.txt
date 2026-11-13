@@ -1,0 +1,5 @@
+SANAT GALERISI - KOD GUNCELLEMESI
+
+Bu paketi GitHub deposunun kok klasorune cikarin ve eslesen kod dosyalarinin uzerine yazin.
+Veritabani ve yuklenmis eserler bu pakete dahil degildir. Mevcut data/ ve uploads/ klasorlerini koruyun; silmeyin veya degistirmeyin.
+Tema karsilastirma sayfasi ayrica verilmistir; secim yapilmadan canli ana sayfaya uygulanmamistir.

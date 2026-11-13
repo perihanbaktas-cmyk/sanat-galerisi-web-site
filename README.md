@@ -39,4 +39,3 @@ Bu proje Python sunucusu ve yönetim paneli çalıştırdığı için Render’d
 Yerel `data/site.sqlite3` ve `uploads/works/` GitHub’a dahil edilmez. Bu nedenle Render’daki ilk kurulumda mevcut yerel eser kataloğu otomatik aktarılmaz; yayınlandıktan sonra yönetim panelinden eserleri ve görsellerini yükleyin veya önce katalog verisini ayrıca taşıyın.
 
 GitHub Pages Python sunucusu ve SQLite çalıştırmadığından siteyi orada tek başına çalıştırmaz. Python destekli barındırma gerekir. Varsayılan `127.0.0.1:8000` adresi yalnızca bu bilgisayardan erişilir.
-
