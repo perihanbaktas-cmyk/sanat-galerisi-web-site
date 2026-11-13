@@ -545,23 +545,57 @@ class SiteHandler(BaseHTTPRequestHandler):
             if not self.csrf_ok(fields): return self.send_error(403, "İstek doğrulanamadı. Sayfayı yenileyip tekrar deneyin.")
         if path == "/atolye-yonetim-8f31/products/save":
             try:
-                pid = int(fields.get("id") or 0)
-                code = fields.get("code", "").strip().upper()[:30]
-                title = fields.get("title", "").strip()[:120]
-                width = int(fields.get("width", "0"))
-                height = int(fields.get("height", "0"))
-                unit = fields.get("size_unit", "cm").strip()[:8]
-                size = f"{width}x{height} {unit}" if width > 0 and height > 0 else ""
-                category = fields.get("category_choice", "").strip()[:80]
-                publish_at = fields.get("publish_at", "").strip()
+                def form_value(*names):
+                    for name in names:
+                        value = fields.get(name, "")
+                        if isinstance(value, (list, tuple)):
+                            value = next((item for item in reversed(value) if str(item).strip()), "")
+                        value = str(value or "").strip()
+                        if value:
+                            return value
+                    return ""
+
+                pid = int(form_value("id") or 0)
+                code = form_value("code").upper()[:30]
+                title = form_value("title")[:120]
+                width_text, height_text = form_value("width"), form_value("height")
+                unit = (form_value("size_unit") or "cm")[:8]
+                size = ""
+                if width_text and height_text:
+                    try:
+                        width, height = int(width_text), int(height_text)
+                    except ValueError:
+                        width = height = 0
+                    if 0 < width <= 500 and 0 < height <= 500:
+                        size = f"{width}x{height} {unit}"
+                else:
+                    # Accept older admin forms that submitted a single formatted size field.
+                    legacy_size = form_value("size", "dimensions", "measurement")
+                    match = re.fullmatch(r"\s*(\d+)\s*[x×]\s*(\d+)\s*(cm|mm|inç|inch)?\s*", legacy_size, re.I)
+                    if match:
+                        size_unit = (match.group(3) or unit).lower()
+                        size_unit = "inç" if size_unit == "inch" else size_unit
+                        size = f"{int(match.group(1))}x{int(match.group(2))} {size_unit}"
+                category = form_value("category_choice", "category_choice[]", "category", "category_name")[:80]
+                publish_at = form_value("publish_at")
                 if publish_at:
                     try: publish_at = datetime.fromisoformat(publish_at).strftime("%Y-%m-%dT%H:%M")
                     except ValueError: raise ValueError("Yayın tarihi ve saati geçerli değil.")
-                price = int(fields.get("price", "0"))
-                sale = int(fields.get("sale_price")) if fields.get("sale_price", "").strip() else None
-                desc = fields.get("description", "").strip()[:1500]
-                wa = safe_url(fields.get("whatsapp_url", ""))
-                if not code or not title or not size or not category or price < 0: raise ValueError("Kod, ad, ölçü, kategori ve geçerli bir fiyat girin.")
+                try:
+                    price = int(form_value("price") or "-1")
+                    sale_text = form_value("sale_price")
+                    sale = int(sale_text) if sale_text else None
+                except ValueError:
+                    raise ValueError("Liste ve indirim fiyatlarını tam sayı olarak girin.")
+                desc = form_value("description")[:1500]
+                wa = safe_url(form_value("whatsapp_url"))
+                missing = []
+                if not code: missing.append("eser kodu")
+                if not title: missing.append("eser adı")
+                if not size: missing.append("geçerli ölçü (genişlik × yükseklik)")
+                if not category: missing.append("kategori seçimi")
+                if price < 0: missing.append("geçerli liste fiyatı")
+                if missing: raise ValueError("Eksik veya geçersiz alan: " + ", ".join(missing) + ".")
                 image = self.upload_file(files.get("image"), "works", "work-")
                 featured, sold = int(fields.get("featured") == "1"), int(fields.get("sold") == "1")
                 show_new = int(fields.get("show_new") == "1")
