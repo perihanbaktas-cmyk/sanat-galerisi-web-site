@@ -32,3 +32,29 @@
 @media(max-width:700px){.product-card{padding:8px}.art-frame{aspect-ratio:1/1}.product-info{padding:8px 5px 7px}.product-info h3{font-size:15px;line-height:1.12}.product-price{margin:6px 0!important}.description{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden;min-height:0}.actions{margin-top:6px}.product-info .like-row{margin-top:4px!important}}
 
 .art-frame[data-work-code]::after{content:attr(data-work-code);position:absolute;z-index:3;left:10px;top:10px;padding:5px 9px;border:1px solid rgba(255,255,255,.72);border-radius:999px;background:rgba(255,252,250,.94);color:#73546a;font:700 10px/1 Arial,sans-serif;letter-spacing:.08em;box-shadow:0 3px 10px rgba(54,39,42,.12);pointer-events:none}
+
+/* Symmetric admin forms: two columns on desktop and a single vertical flow on mobile. */
+.admin-form{max-width:1120px}
+.admin-form-layout,.admin-settings-layout{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));align-items:start;gap:15px}
+.admin-form-layout>.admin-form-section,.admin-settings-layout>.admin-settings-section{box-sizing:border-box;min-width:0;margin:0;padding:16px 18px;border:1px solid #e8ddd7;border-radius:15px;background:#fffdfb}
+.admin-form-section legend,.admin-settings-section legend{padding:0 8px;color:#40564b;font-weight:700;font-size:14px}
+.admin-form-section .form-grid{gap:12px}
+.admin-form-section .check-row{margin:0;gap:12px}
+.admin-form-layout>.span-2,.admin-settings-layout>.span-2{grid-column:1/-1}
+.admin-form-section .admin-upload-field{display:grid;gap:9px;padding:13px;border:1px dashed #d9c9d1;border-radius:12px;background:#fff}
+.admin-form-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:17px;padding-top:15px;border-top:1px solid #eee5df}
+.admin-form-actions .button.ghost{margin-left:0}
+.admin-settings-card{max-width:1120px;margin:0 auto 70px;padding:clamp(16px,3vw,30px)}
+.admin-settings-section{display:grid;align-content:start;gap:13px}
+.admin-settings-section>label,.admin-settings-about>div>label{display:grid;gap:6px;color:#5f565d;font-size:12px;font-weight:600}
+.admin-settings-section textarea,.admin-settings-section input[type=text],.admin-settings-section input[type=url],.admin-settings-section input[type=file]{width:100%;min-width:0}
+.admin-settings-about{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(240px,.85fr);align-items:start;gap:18px}
+.admin-settings-about>div{display:grid;align-content:start;gap:14px;min-width:0}
+.admin-settings-about textarea{min-height:175px;resize:vertical}
+.settings-help{grid-column:1/-1;margin:0;color:#827783;font-size:13px}
+.admin-settings-socials{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}
+.about-image-preview{display:grid;grid-template-columns:92px 1fr;align-items:center;gap:11px;padding:10px;border:1px solid #e8ddd7;border-radius:12px;background:#faf6f2;color:#827783;font-size:12px}
+.about-image-preview img{width:92px;height:78px;object-fit:cover;border-radius:9px}
+.about-image-preview.is-empty{grid-template-columns:42px 1fr;min-height:76px}
+.about-image-preview.is-empty span{color:#e2a0b8;font:38px/1 Georgia,serif;text-align:center}
+@media(max-width:760px){.admin-form{margin:0 12px 45px}.admin-form-layout,.admin-settings-layout{grid-template-columns:minmax(0,1fr);gap:12px}.admin-form-layout>.span-2,.admin-settings-layout>.span-2{grid-column:1}.admin-form-layout>.admin-form-section,.admin-settings-layout>.admin-settings-section{padding:14px}.admin-form-section .form-grid,.admin-settings-socials,.admin-settings-about{grid-template-columns:minmax(0,1fr)}.admin-form-section .form-grid>.span-2,.admin-settings-about .span-2{grid-column:1}.settings-help{grid-column:1}.admin-settings-card{margin:0 12px 45px;padding:14px}.admin-form-actions{justify-content:stretch}.admin-form-actions>*{flex:1}.admin-settings-card .wa-account-row{grid-template-columns:minmax(0,1fr)}.admin-settings-card .wa-account-row .button{justify-self:start}}

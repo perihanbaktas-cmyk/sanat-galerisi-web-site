@@ -13,3 +13,18 @@ categoryInputs.forEach((checkbox) => {
     });
   });
 });
+
+const whatsappAccountPicker = document.querySelector('#whatsapp-account-picker');
+const whatsappUrlField = document.querySelector('input[name="whatsapp_url"]');
+if (whatsappAccountPicker && whatsappUrlField) {
+  whatsappAccountPicker.addEventListener('change', () => {
+    const selectedUrl = whatsappAccountPicker.selectedOptions[0]?.dataset.url;
+    whatsappUrlField.value = selectedUrl || '';
+  });
+  whatsappUrlField.addEventListener('input', () => {
+    const selectedUrl = whatsappAccountPicker.selectedOptions[0]?.dataset.url;
+    if (whatsappAccountPicker.value && whatsappUrlField.value !== selectedUrl) {
+      whatsappAccountPicker.value = '';
+    }
+  });
+}
