@@ -437,7 +437,8 @@ class SiteHandler(BaseHTTPRequestHandler):
         return None
 
     def csrf_ok(self, fields):
-        return bool(self.get_admin() and hmac.compare_digest(str(fields.get("csrf", "")), settings().get("csrf_token", "")))
+        session = self.get_admin()
+        return bool(session and hmac.compare_digest(str(fields.get("csrf", "")), str(session.get("csrf", ""))))
 
     def register_visitor(self):
         match = re.search(r"(?:^|;\s*)gallery_visitor=([a-f0-9]{32})(?:;|$)", self.headers.get("Cookie", ""))
@@ -762,7 +763,6 @@ class SiteHandler(BaseHTTPRequestHandler):
                     digest = hashlib.pbkdf2_hmac("sha256", fields.get("password", "").encode(), raw[:16], 310000)
                     if hmac.compare_digest(raw[16:], digest):
                         csrf = secrets.token_urlsafe(24)
-                        with connect() as c: c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('csrf_token',?)", (csrf,))
                         payload = base64.urlsafe_b64encode(json.dumps({"id":1,"csrf":csrf,"exp":time.time()+86400*7}).encode()).decode().rstrip("=")
                         sig = hmac.new(settings()["session_secret"].encode(), payload.encode(), hashlib.sha256).hexdigest()
                         return self.redirect("/atolye-yonetim-8f31/products", [("Set-Cookie", f"gallery_admin={payload}.{sig}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800")])
@@ -771,7 +771,9 @@ class SiteHandler(BaseHTTPRequestHandler):
         if path.startswith("/atolye-yonetim-8f31/"):
             admin = self.get_admin()
             if not admin: return self.redirect("/atolye-yonetim-8f31/login")
-            if not self.csrf_ok(fields): return self.send_error(403, "İstek doğrulanamadı. Sayfayı yenileyip tekrar deneyin.")
+            if not self.csrf_ok(fields):
+                message = "<section class='narrow form-card'><h1>İstek doğrulanamadı</h1><p>Güvenlik anahtarı geçersiz veya süresi dolmuş. Sayfayı yenileyip tekrar deneyin.</p><a href='/atolye-yonetim-8f31/products'>Yönetim paneline dön</a></section>"
+                return self.send_html(render("İstek doğrulanamadı", message), 403)
         if path == "/atolye-yonetim-8f31/products/save":
             try:
                 def form_value(*names):
