@@ -20,6 +20,10 @@ document.addEventListener('click', function (event) {
 });
 
 (function () {
+  // The homepage wrapper owns like state for its embedded gallery.
+  // Do not bind a second handler or race its initial state request.
+  if (window.frameElement && window.frameElement.id === 'legacy-home') return;
+
   function visitorId() {
     const key = 'perihan-gallery-visitor';
     try {
