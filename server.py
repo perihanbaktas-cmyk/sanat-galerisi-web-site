@@ -21,7 +21,7 @@ from email.parser import BytesParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Lock
-from urllib.parse import parse_qs, quote, urlencode, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 try:
     from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -151,9 +151,6 @@ def init_db():
             "about_heading": "Sanatla İç İçe Bir Yaşam",
             "about_text": "Sanat benim için yalnızca renkleri yan yana getirmek değil; duyguları, anıları ve doğadan aldığım ilhamı tuvale taşımak. Her eserimi atölyemde, renklerin ve mevsimlerin bende uyandırdığı hislerle, sabırla ve özenle hazırlıyorum.\n\nÇiçeklerden, bahar ışığından ve günlük hayatın küçük güzelliklerinden ilham alıyorum. Eserlerimin evlerinize huzur ve kendine ait bir hikâye taşımasını diliyorum.",
             "session_secret": secrets.token_hex(32),
-            "admin_totp_secret": "", "admin_totp_pending_secret": "",
-            "admin_totp_pending_token": "", "admin_totp_pending_exp": "0",
-            "admin_totp_last_counter": "-1", "admin_totp_recovery_hashes": "[]",
             "admin_session_version": "0",
         }
         for k, v in defaults.items():
@@ -175,39 +172,17 @@ def settings():
         return {r["key"]: r["value"] for r in c.execute("SELECT key,value FROM settings")}
 
 
-def new_totp_secret():
-    return base64.b32encode(secrets.token_bytes(20)).decode("ascii").rstrip("=")
+def configured_admin_login_code():
+    return os.environ.get("GALLERY_ADMIN_LOGIN_CODE", "").strip()
 
 
-def totp_counter_for_code(secret, code, at_time=None, window=1):
-    code = re.sub(r"\s+", "", str(code or ""))
-    if not re.fullmatch(r"\d{6}", code):
-        return None
-    try:
-        key = base64.b32decode(secret + "=" * (-len(secret) % 8), casefold=True)
-    except (ValueError, TypeError):
-        return None
-    current = int((time.time() if at_time is None else at_time) // 30)
-    for counter in range(current - window, current + window + 1):
-        digest = hmac.new(key, counter.to_bytes(8, "big"), hashlib.sha1).digest()
-        offset = digest[-1] & 0x0f
-        value = (int.from_bytes(digest[offset:offset + 4], "big") & 0x7fffffff) % 1_000_000
-        if hmac.compare_digest(f"{value:06d}", code):
-            return counter
-    return None
+def valid_admin_login_code(code):
+    return bool(re.fullmatch(r"[0-9]{6}", str(code or "").strip()))
 
 
-def totp_uri(secret, account="Yönetici"):
-    issuer = "Perihan Baktaş Sanat Atölyesi"
-    label = quote(f"{issuer}:{account}", safe="")
-    return f"otpauth://totp/{label}?secret={secret}&issuer={quote(issuer)}&algorithm=SHA1&digits=6&period=30"
-
-
-def totp_enrollment_content(secret, error=""):
-    grouped_secret = " ".join(secret[i:i + 4] for i in range(0, len(secret), 4))
-    notice = f"<p class='notice'>{esc(error)}</p>" if error else ""
-    uri = esc(totp_uri(secret))
-    return f"""<section class='page-intro'><span class='eyebrow'>HESAP GÜVENLİĞİ</span><h1>İki aşamalı doğrulamayı kur</h1><p>Bu adım tamamlanana kadar yönetim paneli eski oturumlara kapalı kalır.</p></section><section class='narrow form-card'><h2>Authenticator uygulamana ekle</h2><p>Google Authenticator, Microsoft Authenticator veya benzeri bir uygulamada “kurulum anahtarını gir” seçeneğini aç.</p><div class='totp-secret'>{esc(grouped_secret)}</div><p><a class='button ghost' href='{uri}'>Authenticator uygulamasında aç</a></p><p class='settings-help'>Hesap adı: Perihan Baktaş Yönetici · Anahtar bu ekranda yalnızca kurulum için gösterilir.</p>{notice}<form method='post' action='/atolye-yonetim-8f31/login' autocomplete='off'><input type='hidden' name='step' value='enable_2fa'><label>Uygulamadaki 6 haneli kod<input name='code' type='text' inputmode='numeric' pattern='[0-9 ]{{6,8}}' maxlength='8' autocomplete='one-time-code' required autofocus></label><button class='button wide'>2FA’yı etkinleştir</button></form><p class='settings-help'>Kurulum 10 dakika içinde tamamlanmalı. Süre dolarsa giriş sayfasından yeniden başlat.</p></section>"""
+def admin_login_code_version(session_secret, code):
+    message = ("gallery-admin-login-code:" + str(code)).encode()
+    return hmac.new(str(session_secret).encode(), message, hashlib.sha256).hexdigest()
 
 
 def admin_login_is_limited(client):
@@ -627,14 +602,16 @@ class SiteHandler(BaseHTTPRequestHandler):
         value = self.cookie_value("gallery_admin")
         try:
             cfg = settings()
-            if not cfg.get("admin_totp_secret"):
+            login_code = configured_admin_login_code()
+            if not valid_admin_login_code(login_code):
                 return None
             payload, sig = value.split(".", 1)
             secret = cfg["session_secret"]
             expected = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
             data = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
             if (hmac.compare_digest(sig, expected) and data.get("exp", 0) > time.time()
-                    and data.get("id") == 1 and data.get("mfa") is True
+                    and data.get("id") == 1 and data.get("auth_method") == "password_and_fixed_code"
+                    and hmac.compare_digest(str(data.get("code_version", "")), admin_login_code_version(secret, login_code))
                     and data.get("ver") == int(cfg.get("admin_session_version", "0"))):
                 return data
         except Exception:
@@ -660,54 +637,19 @@ class SiteHandler(BaseHTTPRequestHandler):
             cookie += "; Secure"
         return cookie
 
-    def get_mfa_setup_session(self):
-        value = self.cookie_value("gallery_2fa_setup")
-        try:
-            cfg = settings()
-            payload, signature = value.split(".", 1)
-            expected = hmac.new(cfg["session_secret"].encode(), payload.encode(), hashlib.sha256).hexdigest()
-            data = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
-            if not hmac.compare_digest(signature, expected) or data.get("exp", 0) <= time.time():
-                return None
-            if not hmac.compare_digest(str(data.get("token", "")), cfg.get("admin_totp_pending_token", "")):
-                return None
-            if float(cfg.get("admin_totp_pending_exp", "0")) <= time.time():
-                return None
-            return data
-        except Exception:
-            return None
-
     def admin_session_cookie(self, csrf=None):
         cfg = settings()
+        login_code = configured_admin_login_code()
+        if not valid_admin_login_code(login_code):
+            raise ValueError("GALLERY_ADMIN_LOGIN_CODE must contain exactly six digits")
         payload = {
             "id": 1, "csrf": csrf or secrets.token_urlsafe(24),
-            "exp": time.time() + 86400, "mfa": True,
+            "exp": time.time() + 86400,
+            "auth_method": "password_and_fixed_code",
+            "code_version": admin_login_code_version(cfg["session_secret"], login_code),
             "ver": int(cfg.get("admin_session_version", "0")),
         }
         return self.signed_cookie("gallery_admin", payload, 86400)
-
-    def consume_admin_factor(self, code):
-        normalized = re.sub(r"[\s-]", "", str(code or "")).upper()
-        with connect() as c:
-            c.execute("BEGIN IMMEDIATE")
-            cfg = {row["key"]: row["value"] for row in c.execute("SELECT key,value FROM settings WHERE key IN ('admin_totp_secret','admin_totp_last_counter','admin_totp_recovery_hashes')")}
-            secret = cfg.get("admin_totp_secret", "")
-            counter = totp_counter_for_code(secret, code)
-            last_counter = int(cfg.get("admin_totp_last_counter", "-1"))
-            if counter is not None and counter > last_counter:
-                c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('admin_totp_last_counter',?)", (str(counter),))
-                return True
-            try:
-                recovery_hashes = json.loads(cfg.get("admin_totp_recovery_hashes", "[]"))
-            except json.JSONDecodeError:
-                recovery_hashes = []
-            candidate = hashlib.sha256(normalized.encode()).hexdigest()
-            match_index = next((i for i, saved in enumerate(recovery_hashes) if hmac.compare_digest(str(saved), candidate)), None)
-            if match_index is None:
-                return False
-            recovery_hashes.pop(match_index)
-            c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('admin_totp_recovery_hashes',?)", (json.dumps(recovery_hashes),))
-            return True
 
     def require_admin(self):
         data = self.get_admin()
@@ -864,16 +806,12 @@ class SiteHandler(BaseHTTPRequestHandler):
             content = "<section class='page-intro'><span class='eyebrow'>İLK KURULUM</span><h1>Yönetici Parolası Oluştur</h1><p>Bu panel yalnızca sizin belirleyeceğiniz parola ile açılır. En az 10 karakter kullanın.</p></section><section class='narrow form-card'><form method='post' action='/atolye-yonetim-8f31/setup'><label>Yeni parola<input type='password' name='password' minlength='10' required></label><label>Parolayı doğrula<input type='password' name='confirm' minlength='10' required></label><button class='button wide'>Yönetici Hesabı Oluştur</button></form></section>"
             return self.send_html(render("İlk Kurulum", content))
         if path == "/atolye-yonetim-8f31/login":
-            cfg = settings()
-            mfa_enabled = bool(cfg.get("admin_totp_secret"))
-            setup_key_ready = len(os.environ.get("GALLERY_2FA_SETUP_KEY", "").strip()) >= 32
-            content = "<section class='page-intro'><span class='eyebrow'>YÖNETİM PANELİ</span><h1>Yönetici Girişi</h1><p>Yönetim paneli parola ve doğrulama koduyla korunur.</p></section>"
-            if mfa_enabled:
-                content += "<section class='narrow form-card'><form method='post' action='/atolye-yonetim-8f31/login' autocomplete='off'><label>Parola<input type='password' name='password' autocomplete='current-password' required autofocus></label><label>Authenticator kodu veya yedek kod<input type='text' name='code' inputmode='text' pattern='[0-9A-Fa-f -]{6,24}' maxlength='24' autocomplete='one-time-code' required></label><button class='button wide'>Güvenli Giriş Yap</button><small>Authenticator uygulamasındaki 6 haneli kodu veya daha önce kaydettiğin tek kullanımlık yedek kodlardan birini kullan.</small></form></section>"
-            elif setup_key_ready:
-                content += "<section class='narrow form-card'><p class='notice'>İlk girişte Authenticator kurulumu zorunludur. Kurulum için Render’daki özel anahtarını da gir.</p><form method='post' action='/atolye-yonetim-8f31/login' autocomplete='off'><label>Yönetici parolası<input type='password' name='password' autocomplete='current-password' required autofocus></label><label>İlk kurulum anahtarı<input type='password' name='setup_key' autocomplete='off' required></label><button class='button wide'>2FA Kurulumunu Başlat</button></form></section>"
+            login_code_ready = valid_admin_login_code(configured_admin_login_code())
+            content = "<section class='page-intro'><span class='eyebrow'>YÖNETİM PANELİ</span><h1>Yönetici Girişi</h1><p>Yönetim paneli parola ve 6 haneli sabit giriş koduyla korunur.</p></section>"
+            if login_code_ready:
+                content += "<section class='narrow form-card'><form method='post' action='/atolye-yonetim-8f31/login' autocomplete='off'><label>Yönetici parolası<input type='password' name='password' autocomplete='current-password' required autofocus></label><label>6 haneli giriş kodu<input type='password' name='code' inputmode='numeric' pattern='[0-9]{6}' maxlength='6' autocomplete='off' required></label><button class='button wide'>Güvenli Giriş Yap</button></form></section>"
             else:
-                content += "<section class='narrow form-card'><h2>2FA kurulumu bekleniyor</h2><p>Parola tek başına yönetim panelini açamaz. Render servisinin Environment bölümüne en az 32 karakterli özel bir <code>GALLERY_2FA_SETUP_KEY</code> ekle. İlk kurulum tamamlanınca bu değişkeni kaldır.</p></section>"
+                content += "<section class='narrow form-card'><h2>Giriş kodu ayarlanmamış</h2><p>Render Environment bölümüne <code>GALLERY_ADMIN_LOGIN_CODE</code> adıyla tam 6 rakamlı bir kod ekleyin. Kod giriş ekranında istenir ve burada gösterilmez.</p></section>"
             with connect() as c: exists = c.execute("SELECT 1 FROM admin WHERE id=1").fetchone()
             content += "" if exists else "<p class='center'><a href='/atolye-yonetim-8f31/setup'>İlk yönetici parolasını oluştur</a></p>"
             return self.send_html(render("Yönetici Girişi", content), headers=[("Cache-Control", "no-store")])
@@ -944,11 +882,11 @@ class SiteHandler(BaseHTTPRequestHandler):
                 input_field("Satılan eser toplamı", "stat_sold", displayed_stats["sold"], "number", True, "min='0' step='1' inputmode='numeric'"),
                 input_field("Yayındaki eser toplamı", "stat_available", displayed_stats["available"], "number", True, "min='0' step='1' inputmode='numeric'"),
             ))
-            try:
-                recovery_remaining = len(json.loads(cfg.get("admin_totp_recovery_hashes", "[]")))
-            except (TypeError, json.JSONDecodeError):
-                recovery_remaining = 0
-            totp_status = f"<section class='form-card' style='max-width:1280px;margin:0 auto 18px'><h2>Güvenlik</h2><p><strong>İki aşamalı doğrulama etkin.</strong> Yönetici girişi parola ve Authenticator kodu gerektirir. Önceki oturumlar geçersizdir.</p><p>Kullanılabilir tek kullanımlık yedek kod: {recovery_remaining}</p></section>"
+            login_code_status = (
+                "<section class='form-card' style='max-width:1280px;margin:0 auto 18px'><h2>Güvenlik</h2><p><strong>Sabit giriş kodu etkin.</strong> Yönetici girişi parola ve 6 haneli kod gerektirir.</p><p>Kodu Render Environment bölümündeki <code>GALLERY_ADMIN_LOGIN_CODE</code> değişkeninden yönetin. Kod bu sayfada gösterilmez.</p></section>"
+                if valid_admin_login_code(configured_admin_login_code()) else
+                "<section class='form-card' style='max-width:1280px;margin:0 auto 18px'><h2>Güvenlik</h2><p><strong>Giriş kodu yapılandırılmamış.</strong> Yönetim paneline erişim için Render Environment bölümünde <code>GALLERY_ADMIN_LOGIN_CODE</code> değişkenini 6 rakam olarak ayarlayın.</p></section>"
+            )
             wa_accounts = parse_whatsapp_accounts(cfg.get("whatsapp_accounts", "[]"))
             account_rows = "".join(f"<div class='wa-account-row' data-wa-account-row><label>Hesap adı<input type='text' data-wa-name maxlength='60' value='{esc(account['name'])}'></label><label>WhatsApp bağlantısı<input type='url' data-wa-url placeholder='Profil / QR bağlantısı' value='{esc(account['url'])}'></label><label>Telefon (ülke koduyla)<input type='tel' inputmode='tel' data-wa-phone placeholder='905xxxxxxxxx' value='{esc(account.get('phone', ''))}'></label><button type='button' class='button ghost wa-remove-account'>Kaldır</button></div>" for account in wa_accounts)
             if not account_rows:
@@ -962,7 +900,7 @@ class SiteHandler(BaseHTTPRequestHandler):
             about_image_preview = f"<div class='about-image-preview'><img src='/{esc(about_image)}' alt='Mevcut Hakkımda fotoğrafı'><small>Mevcut fotoğraf</small></div>" if about_image else "<div class='about-image-preview is-empty'><span>✿</span><small>Henüz fotoğraf yüklenmedi</small></div>"
             about_crop_style = """<style>.about-crop-editor{width:min(100%,400px);margin:12px 0}.about-crop-frame,.about-image-preview{position:relative;width:min(100%,400px);aspect-ratio:4/3;overflow:hidden;border:1px solid #e6d9d4;border-radius:14px;background:linear-gradient(145deg,#ead4dd,#f8eddf 55%,#dce8dc)}.about-crop-frame{touch-action:none;cursor:grab}.about-crop-frame:active{cursor:grabbing}.about-crop-frame img{position:absolute;max-width:none!important;max-height:none!important;user-select:none;-webkit-user-drag:none;pointer-events:none}.about-crop-guide{position:absolute;inset:0;pointer-events:none;border:1px solid rgba(255,255,255,.72);box-shadow:inset 0 0 0 999px rgba(43,32,39,.04)}.about-crop-zoom{display:grid;gap:6px;margin:10px 0 6px;color:#5f565d;font-size:12px;font-weight:600}.about-crop-zoom input{width:100%;accent-color:#79546f}.about-crop-help,.about-crop-status{display:block;margin:6px 0;color:#827783;font-size:12px;line-height:1.5}.about-image-preview{display:grid;place-items:center;margin-top:12px}.about-image-preview img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}.about-image-preview small{position:absolute;left:9px;bottom:9px;padding:5px 8px;border-radius:999px;background:rgba(49,43,47,.65);color:#fff}.about-image-preview.is-empty span{color:#d88eaa;font:90px/1 Georgia,serif}@media(max-width:620px){.about-crop-editor,.about-image-preview{width:100%}}</style>"""
             about_crop_script = """<script>(function(){var form=document.getElementById('settings-form'),input=form&&form.querySelector('input[name=about_image]'),editor=document.getElementById('about-crop-editor'),frame=document.getElementById('about-crop-frame'),image=document.getElementById('about-crop-source'),zoom=document.getElementById('about-crop-zoom'),status=document.getElementById('about-crop-status');if(!form||!input||!editor||!frame||!image)return;var objectUrl='',scale=1,x=0,y=0,renderW=0,renderH=0,drag=null;function paint(){var rect=frame.getBoundingClientRect();if(!image.naturalWidth||!rect.width)return;var cover=Math.max(rect.width/image.naturalWidth,rect.height/image.naturalHeight);scale=cover*Number(zoom.value||1);renderW=image.naturalWidth*scale;renderH=image.naturalHeight*scale;x=Math.min(0,Math.max(rect.width-renderW,x));y=Math.min(0,Math.max(rect.height-renderH,y));image.style.width=renderW+'px';image.style.height=renderH+'px';image.style.left=x+'px';image.style.top=y+'px'}input.addEventListener('change',function(){var file=input.files&&input.files[0];if(!file)return;if(objectUrl)URL.revokeObjectURL(objectUrl);objectUrl=URL.createObjectURL(file);image.onload=function(){editor.hidden=false;var rect=frame.getBoundingClientRect(),cover=Math.max(rect.width/image.naturalWidth,rect.height/image.naturalHeight),factor=Number(zoom.value||1);renderW=image.naturalWidth*cover*factor;renderH=image.naturalHeight*cover*factor;x=(rect.width-renderW)/2;y=(rect.height-renderH)/2;paint();status.textContent='';};image.src=objectUrl});zoom.addEventListener('input',function(){var rect=frame.getBoundingClientRect(),cx=rect.width/2,cy=rect.height/2,ratio=Number(zoom.value||1);if(renderW&&renderH){var oldW=renderW,oldH=renderH;paint();x=cx-(cx-x)*renderW/oldW;y=cy-(cy-y)*renderH/oldH;paint()}else paint()});frame.addEventListener('pointerdown',function(e){if(!image.naturalWidth)return;drag={pointer:e.pointerId,startX:e.clientX,startY:e.clientY,x:x,y:y};frame.setPointerCapture(e.pointerId)});frame.addEventListener('pointermove',function(e){if(!drag||drag.pointer!==e.pointerId)return;x=drag.x+e.clientX-drag.startX;y=drag.y+e.clientY-drag.startY;paint()});['pointerup','pointercancel'].forEach(function(type){frame.addEventListener(type,function(){drag=null})});window.addEventListener('resize',paint);form.addEventListener('submit',function(event){if(event.defaultPrevented)return;var file=input.files&&input.files[0];if(!file||!image.naturalWidth)return;event.preventDefault();var button=form.querySelector('button[type=submit]');if(button)button.disabled=true;status.textContent='Fotoğraf seçtiğiniz kadraja göre hazırlanıyor…';var rect=frame.getBoundingClientRect(),canvas=document.createElement('canvas');canvas.width=1200;canvas.height=900;var context=canvas.getContext('2d'),sx=Math.max(0,-x/scale),sy=Math.max(0,-y/scale),sw=Math.min(image.naturalWidth-sx,rect.width/scale),sh=Math.min(image.naturalHeight-sy,rect.height/scale);context.drawImage(image,sx,sy,sw,sh,0,0,canvas.width,canvas.height);canvas.toBlob(function(blob){if(!blob){status.textContent='Fotoğraf hazırlanamadı. Lütfen yeniden deneyin.';if(button)button.disabled=false;return}try{var transfer=new DataTransfer();transfer.items.add(new File([blob],'about-photo-cropped.jpg',{type:'image/jpeg',lastModified:Date.now()}));input.files=transfer.files;HTMLFormElement.prototype.submit.call(form)}catch(error){status.textContent='Kırpılan fotoğraf forma eklenemedi. Lütfen yeniden deneyin.';if(button)button.disabled=false}},'image/jpeg',.9)});})();</script>"""
-            content = f"""<section class='admin-top'><div><span class='eyebrow'>SİTE AYARLARI</span><h1>Site Ayarları</h1><p>Ana sayfa tanıtımını, iletişim ve sosyal hesapları yönetin.</p></div>{admin_nav('settings')}</section>{totp_status}{accounts_style}{about_crop_style}<section class='form-card admin-settings-card'><form id='settings-form' method='post' enctype='multipart/form-data' action='/atolye-yonetim-8f31/settings'><input type='hidden' name='csrf' value='{csrf}'><div class='admin-settings-layout'><fieldset class='admin-settings-section'><legend>Atölye kimliği</legend>{input_field('Atölye adı', 'site_name', cfg.get('site_name'), required=True)}</fieldset><fieldset class='admin-settings-section'><legend>WhatsApp ve iletişim</legend>{input_field('WhatsApp bağlantısı', 'whatsapp_url', cfg.get('whatsapp_url'), 'url')}{input_field('Varsayılan telefon (ülke koduyla)', 'whatsapp_phone', cfg.get('whatsapp_phone'), 'tel', extra="inputmode='tel' placeholder='905xxxxxxxxx'")}{accounts_manager}<label>“Soru Sor” hazır mesajı<textarea name='question_message' rows='3' maxlength='1000' placeholder='Merhaba, {{{{code}}}} kodlu tablonuz hakkında soru sormak istiyorum.'>{esc(cfg.get('question_message'))}</textarea><small>{{{{code}}}} eser kodunu, {{{{title}}}} eser adını ekler. QR/profil linki yerine numaraya yönlendirmek için hesap telefonunu ülke koduyla kaydedin.</small></label></fieldset><fieldset class='admin-settings-section span-2'><legend>Hakkımda bölümü</legend><p class='settings-help'>Ana sayfadaki “Hakkımda” menüsü buraya gelir. Fotoğraf solda, hikâyeniz yanında görünür.</p><div class='admin-settings-about'><div>{input_field('Başlık', 'about_heading', cfg.get('about_heading'), extra="maxlength='160'")}<label>Hayat hikâyesi / tanıtım yazısı<textarea name='about_text' rows='7' maxlength='8000' placeholder='Atölyenizi, sanata yaklaşımınızı ve ilhamınızı anlatın.'>{esc(cfg.get('about_text'))}</textarea><small>Boş satır bırakarak yazıyı paragraflara ayırabilirsiniz.</small></label></div><div><label>Yazının yanında görünecek fotoğraf<input type='file' name='about_image' accept='.jpg,.jpeg,.jfif,.png,.webp'><small>JPG, PNG veya WEBP · en fazla 8 MB</small></label><div class='about-crop-editor' id='about-crop-editor' hidden><div class='about-crop-frame' id='about-crop-frame' aria-label='Fotoğraf kırpma alanı'><img id='about-crop-source' alt='Kırpma önizlemesi'><span class='about-crop-guide' aria-hidden='true'></span></div><label class='about-crop-zoom'>Yakınlaştır<input id='about-crop-zoom' type='range' min='1' max='2.5' step='0.05' value='1'></label><small class='about-crop-help'>Fotoğrafı sürükleyerek kadrajı seçin. Kaydedilen görsel, ana sayfadaki 4:3 fotoğraf alanına göre kırpılır.</small><small class='about-crop-status' id='about-crop-status' role='status'></small></div>{about_image_preview}</div></div></fieldset><fieldset class='admin-settings-section span-2'><legend>Sosyal medya hesapları</legend><div class='admin-settings-socials'>{input_field('Instagram URL', 'instagram_url', cfg.get('instagram_url'), 'url')}{input_field('TikTok URL', 'tiktok_url', cfg.get('tiktok_url'), 'url')}{input_field('Telegram URL', 'telegram_url', cfg.get('telegram_url'), 'url')}</div></fieldset><fieldset class='admin-settings-section span-2'><legend>Ana sayfa sayaçları</legend><p>Değerleri buradan ayarlayabilirsiniz. Bundan sonraki yeni ziyaretler ve eser durumundaki değişiklikler sayaca eklenmeye devam eder.</p><div class='admin-settings-socials'>{stats_fields}</div></fieldset></div><button class='button wide'>Ayarları Kaydet</button></form></section>{accounts_script}{about_crop_script}"""
+            content = f"""<section class='admin-top'><div><span class='eyebrow'>SİTE AYARLARI</span><h1>Site Ayarları</h1><p>Ana sayfa tanıtımını, iletişim ve sosyal hesapları yönetin.</p></div>{admin_nav('settings')}</section>{login_code_status}{accounts_style}{about_crop_style}<section class='form-card admin-settings-card'><form id='settings-form' method='post' enctype='multipart/form-data' action='/atolye-yonetim-8f31/settings'><input type='hidden' name='csrf' value='{csrf}'><div class='admin-settings-layout'><fieldset class='admin-settings-section'><legend>Atölye kimliği</legend>{input_field('Atölye adı', 'site_name', cfg.get('site_name'), required=True)}</fieldset><fieldset class='admin-settings-section'><legend>WhatsApp ve iletişim</legend>{input_field('WhatsApp bağlantısı', 'whatsapp_url', cfg.get('whatsapp_url'), 'url')}{input_field('Varsayılan telefon (ülke koduyla)', 'whatsapp_phone', cfg.get('whatsapp_phone'), 'tel', extra="inputmode='tel' placeholder='905xxxxxxxxx'")}{accounts_manager}<label>“Soru Sor” hazır mesajı<textarea name='question_message' rows='3' maxlength='1000' placeholder='Merhaba, {{{{code}}}} kodlu tablonuz hakkında soru sormak istiyorum.'>{esc(cfg.get('question_message'))}</textarea><small>{{{{code}}}} eser kodunu, {{{{title}}}} eser adını ekler. QR/profil linki yerine numaraya yönlendirmek için hesap telefonunu ülke koduyla kaydedin.</small></label></fieldset><fieldset class='admin-settings-section span-2'><legend>Hakkımda bölümü</legend><p class='settings-help'>Ana sayfadaki “Hakkımda” menüsü buraya gelir. Fotoğraf solda, hikâyeniz yanında görünür.</p><div class='admin-settings-about'><div>{input_field('Başlık', 'about_heading', cfg.get('about_heading'), extra="maxlength='160'")}<label>Hayat hikâyesi / tanıtım yazısı<textarea name='about_text' rows='7' maxlength='8000' placeholder='Atölyenizi, sanata yaklaşımınızı ve ilhamınızı anlatın.'>{esc(cfg.get('about_text'))}</textarea><small>Boş satır bırakarak yazıyı paragraflara ayırabilirsiniz.</small></label></div><div><label>Yazının yanında görünecek fotoğraf<input type='file' name='about_image' accept='.jpg,.jpeg,.jfif,.png,.webp'><small>JPG, PNG veya WEBP · en fazla 8 MB</small></label><div class='about-crop-editor' id='about-crop-editor' hidden><div class='about-crop-frame' id='about-crop-frame' aria-label='Fotoğraf kırpma alanı'><img id='about-crop-source' alt='Kırpma önizlemesi'><span class='about-crop-guide' aria-hidden='true'></span></div><label class='about-crop-zoom'>Yakınlaştır<input id='about-crop-zoom' type='range' min='1' max='2.5' step='0.05' value='1'></label><small class='about-crop-help'>Fotoğrafı sürükleyerek kadrajı seçin. Kaydedilen görsel, ana sayfadaki 4:3 fotoğraf alanına göre kırpılır.</small><small class='about-crop-status' id='about-crop-status' role='status'></small></div>{about_image_preview}</div></div></fieldset><fieldset class='admin-settings-section span-2'><legend>Sosyal medya hesapları</legend><div class='admin-settings-socials'>{input_field('Instagram URL', 'instagram_url', cfg.get('instagram_url'), 'url')}{input_field('TikTok URL', 'tiktok_url', cfg.get('tiktok_url'), 'url')}{input_field('Telegram URL', 'telegram_url', cfg.get('telegram_url'), 'url')}</div></fieldset><fieldset class='admin-settings-section span-2'><legend>Ana sayfa sayaçları</legend><p>Değerleri buradan ayarlayabilirsiniz. Bundan sonraki yeni ziyaretler ve eser durumundaki değişiklikler sayaca eklenmeye devam eder.</p><div class='admin-settings-socials'>{stats_fields}</div></fieldset></div><button class='button wide'>Ayarları Kaydet</button></form></section>{accounts_script}{about_crop_script}"""
             return self.send_html(render("Yönetim · Ayarlar", content))
         return self.send_error(404)
 
@@ -1095,72 +1033,29 @@ class SiteHandler(BaseHTTPRequestHandler):
             login_client = self.client_address[0]
             if admin_login_is_limited(login_client):
                 return self.send_html(render("Giriş bekletildi", "<section class='narrow form-card'><h1>Biraz bekle</h1><p>Çok sayıda başarısız giriş denemesi oldu. Güvenlik için 15 dakika sonra tekrar dene.</p></section>"), 429, [("Cache-Control", "no-store")])
-            if fields.get("step") == "enable_2fa":
-                setup_session = self.get_mfa_setup_session()
-                cfg = settings()
-                pending_secret = cfg.get("admin_totp_pending_secret", "")
-                counter = totp_counter_for_code(pending_secret, fields.get("code", "")) if setup_session and pending_secret else None
-                if counter is None:
-                    record_admin_login_failure(login_client)
-                    body = render("2FA kurulumu", totp_enrollment_content(pending_secret, "Kod geçersiz veya kurulum süresi dolmuş. Uygulamadaki güncel 6 haneli kodu gir.")) if pending_secret else render("2FA kurulumu", "<section class='narrow form-card'><h1>Kurulum süresi doldu</h1><p>Giriş sayfasından kurulumu yeniden başlat.</p><a href='/atolye-yonetim-8f31/login'>Girişe dön</a></section>")
-                    return self.send_html(body, 401, [("Cache-Control", "no-store")])
-                recovery_codes = [secrets.token_hex(10).upper() for _ in range(8)]
-                recovery_hashes = [hashlib.sha256(code.encode()).hexdigest() for code in recovery_codes]
-                with connect() as c:
-                    c.execute("BEGIN IMMEDIATE")
-                    latest = {row["key"]: row["value"] for row in c.execute("SELECT key,value FROM settings WHERE key IN ('admin_totp_secret','admin_totp_pending_secret','admin_totp_pending_token','admin_totp_pending_exp','admin_session_version')")}
-                    if (latest.get("admin_totp_secret") or not hmac.compare_digest(latest.get("admin_totp_pending_token", ""), str(setup_session.get("token", "")))
-                            or latest.get("admin_totp_pending_secret") != pending_secret or float(latest.get("admin_totp_pending_exp", "0")) <= time.time()):
-                        return self.send_html(render("2FA kurulumu", "<section class='narrow form-card'><h1>Kurulum oturumu geçersiz</h1><p>Giriş sayfasından kurulumu yeniden başlat.</p><a href='/atolye-yonetim-8f31/login'>Girişe dön</a></section>"), 403, [("Cache-Control", "no-store")])
-                    version = int(latest.get("admin_session_version", "0")) + 1
-                    c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('admin_totp_secret',?)", (pending_secret,))
-                    c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('admin_totp_last_counter',?)", (str(counter),))
-                    c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('admin_totp_recovery_hashes',?)", (json.dumps(recovery_hashes),))
-                    c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('admin_session_version',?)", (str(version),))
-                    for key, value in (("admin_totp_pending_secret", ""), ("admin_totp_pending_token", ""), ("admin_totp_pending_exp", "0")):
-                        c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (key, value))
-                codes_markup = "".join(f"<li><code>{code}</code></li>" for code in recovery_codes)
-                success = f"<section class='page-intro'><span class='eyebrow'>GÜVENLİK ETKİN</span><h1>2FA kuruldu</h1><p>Eski yönetici oturumları geçersiz kılındı. Bundan sonra parola ve Authenticator kodu birlikte gerekir.</p></section><section class='narrow form-card'><h2>Yedek kodlarını şimdi kaydet</h2><p>Her kod yalnızca bir kez kullanılabilir. Bunlar tekrar gösterilmeyecek.</p><ol class='totp-recovery-list'>{codes_markup}</ol><p><strong>Kurulum tamamlandıktan sonra Render Environment bölümünden GALLERY_2FA_SETUP_KEY değişkenini sil.</strong></p><a class='button wide' href='/atolye-yonetim-8f31/products'>Yönetim paneline geç</a></section><style>.totp-recovery-list{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding-left:24px}.totp-recovery-list code{display:inline-block;padding:8px 10px;border:1px solid #e5d9ed;border-radius:8px;background:#f7f1fa;font:700 15px/1.2 ui-monospace,monospace;letter-spacing:.08em}@media(max-width:480px){{.totp-recovery-list{{grid-template-columns:1fr}}}}</style>"
-                return self.send_html(render("İki Aşamalı Doğrulama Etkin", success), headers=[("Cache-Control", "no-store"), ("Set-Cookie", self.admin_session_cookie()), ("Set-Cookie", self.clear_cookie("gallery_2fa_setup"))])
-            with connect() as c: row = c.execute("SELECT password_hash FROM admin WHERE id=1").fetchone()
+            expected_code = configured_admin_login_code()
+            if not valid_admin_login_code(expected_code):
+                message = "Render Environment bölümünde GALLERY_ADMIN_LOGIN_CODE değişkenini tam 6 rakam olarak ayarla."
+                body = f"<section class='narrow form-card'><h1>Giriş kodu ayarlanmamış</h1><p>{esc(message)}</p><a href='/atolye-yonetim-8f31/login'>Yeniden dene</a></section>"
+                return self.send_html(render("Giriş yapılandırması gerekli", body), 503, [("Cache-Control", "no-store")])
+            submitted_code = fields.get("code", "").strip()
+            with connect() as c:
+                row = c.execute("SELECT password_hash FROM admin WHERE id=1").fetchone()
+            password_ok = False
             if row:
                 try:
-                    raw = base64.b64decode(row["password_hash"])
+                    raw = base64.b64decode(row["password_hash"], validate=True)
                     digest = hashlib.pbkdf2_hmac("sha256", fields.get("password", "").encode(), raw[:16], 310000)
-                    if hmac.compare_digest(raw[16:], digest):
-                        cfg = settings()
-                        if cfg.get("admin_totp_secret"):
-                            if self.consume_admin_factor(fields.get("code", "")):
-                                clear_admin_login_failures(login_client)
-                                return self.redirect("/atolye-yonetim-8f31/products", [("Set-Cookie", self.admin_session_cookie())])
-                            record_admin_login_failure(login_client)
-                            message = "Parola doğru olabilir; doğrulama kodu geçersiz, süresi dolmuş veya daha önce kullanılmış."
-                            body = "<section class='narrow form-card'><h1>Doğrulama başarısız</h1><p>Authenticator uygulamasındaki yeni kodu veya kullanılmamış yedek kodu gir.</p><a href='/atolye-yonetim-8f31/login'>Yeniden dene</a></section>"
-                            return self.send_html(render("Doğrulama başarısız", body), 401, [("Cache-Control", "no-store")])
-                        bootstrap_key = os.environ.get("GALLERY_2FA_SETUP_KEY", "").strip()
-                        if len(bootstrap_key) < 32:
-                            message = "2FA kurulumu kilitli. Render Environment bölümüne en az 32 karakterli GALLERY_2FA_SETUP_KEY ekleyip yeniden deploy et."
-                            return self.send_html(render("2FA kurulumu gerekli", f"<section class='narrow form-card'><h1>Yönetim girişi kapalı</h1><p>{esc(message)}</p></section>"), 503, [("Cache-Control", "no-store")])
-                        submitted_key = fields.get("setup_key", "").strip()
-                        if not hmac.compare_digest(bootstrap_key, submitted_key):
-                            record_admin_login_failure(login_client)
-                            return self.send_html(render("İlk 2FA kurulumu", "<section class='narrow form-card'><h1>Kurulum anahtarı hatalı</h1><p>Render Environment bölümündeki anahtarı aynen gir.</p><a href='/atolye-yonetim-8f31/login'>Yeniden dene</a></section>"), 401, [("Cache-Control", "no-store")])
-                        clear_admin_login_failures(login_client)
-                        pending_secret = new_totp_secret()
-                        pending_token = secrets.token_urlsafe(32)
-                        pending_exp = time.time() + 600
-                        with connect() as c:
-                            c.execute("BEGIN IMMEDIATE")
-                            active = c.execute("SELECT value FROM settings WHERE key='admin_totp_secret'").fetchone()
-                            if active and active[0]:
-                                return self.redirect("/atolye-yonetim-8f31/login")
-                            for key, value in (("admin_totp_pending_secret", pending_secret), ("admin_totp_pending_token", pending_token), ("admin_totp_pending_exp", str(pending_exp))):
-                                c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (key, value))
-                        setup_cookie = self.signed_cookie("gallery_2fa_setup", {"token": pending_token, "exp": pending_exp}, 600)
-                        return self.send_html(render("2FA kurulumu", totp_enrollment_content(pending_secret)), headers=[("Cache-Control", "no-store"), ("Set-Cookie", setup_cookie)])
-                except Exception: pass
+                    password_ok = len(raw) == 48 and hmac.compare_digest(raw[16:], digest)
+                except Exception:
+                    password_ok = False
+            code_ok = valid_admin_login_code(submitted_code) and hmac.compare_digest(expected_code, submitted_code)
+            if password_ok and code_ok:
+                clear_admin_login_failures(login_client)
+                return self.redirect("/atolye-yonetim-8f31/products", [("Set-Cookie", self.admin_session_cookie())])
             record_admin_login_failure(login_client)
-            return self.send_html(render("Giriş Hatası", "<section class='narrow form-card'><h1>Giriş başarısız</h1><p>Parola, kurulum anahtarı veya doğrulama kodunu kontrol et.</p><a href='/atolye-yonetim-8f31/login'>Yeniden dene</a></section>"), 401, [("Cache-Control", "no-store")])
+            body = "<section class='narrow form-card'><h1>Giriş başarısız</h1><p>Yönetici parolasını ve 6 haneli sabit giriş kodunu kontrol et.</p><a href='/atolye-yonetim-8f31/login'>Yeniden dene</a></section>"
+            return self.send_html(render("Giriş Hatası", body), 401, [("Cache-Control", "no-store")])
         if path.startswith("/atolye-yonetim-8f31/"):
             admin = self.get_admin()
             if not admin: return self.redirect("/atolye-yonetim-8f31/login")
